@@ -1,6 +1,6 @@
 # This Repository is simplified Monodepth2 original code.
-# Excluded detail ablation study code and other model's options.
-# Focused on Monocular Sequence data and Seperated Pose Network
+## Excluded detail ablation study code and other model's options.
+## Focused on Monocular Sequence data and Seperated Pose Network
 ---
 
 This is the reference PyTorch implementation for training and testing depth estimation models using the method described in
