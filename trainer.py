@@ -229,7 +229,12 @@ class Trainer:
         # inputs 중에서 frame_id=0, scale=0인 이미지만 Depth Encoder에 입력으로 넣는다.
         # ("color_aug", <frame_id>, <scale>)        
         features = self.models["encoder"](inputs["color_aug", 0, 0])
-        # outputs = ('disp', scales)
+        
+        # outputs[('disp', scales)].shape : (B, C=1, H//(2**scales), W//(2**scales))
+        # outputs[('disp'), 0].shape : (B, C=1, H, W)
+        # outputs[('disp'), 1].shape : (B, C=1, H/2, W/2)
+        # outputs[('disp'), 2].shape : (B, C=1, H/4, W/4)
+        # outputs[('disp'), 3].shape : (B, C=1, H/8, W/8)
         outputs = self.models["depth"](features)
         
         # pose 예측 결과를 outputs (dict)에 추가함
@@ -335,7 +340,7 @@ class Trainer:
                 # outputs[("color", frame_id, scale)] : I_{t' -> t}
                 # => sample 좌표 (uv 좌표)를 이용하여 I_{t'}를 I_{t}에 맞게 sampling 하여 생성 (I_{t'->t})하고
                 #    최종적으로 I_{t'->t}와 I_{t}의 reprojection loss가 낮아지도록 학습하므로 학습 완료 시 I_{t' -> t}와 I_{t}는 유사해짐
-                # F.grid_sample 연산에 따라 기존 이미지 크기를 벗어난 sample 좌표들은 가장 외곽의 값으로 대체됨
+                #    F.grid_sample 연산에 따라 기존 이미지 크기를 벗어난 sample 좌표들은 가장 외곽의 값으로 대체됨
                 outputs[("color", frame_id, scale)] = F.grid_sample(
                     inputs[("color", frame_id, source_scale)],
                     outputs[("sample", frame_id, scale)],
@@ -351,11 +356,8 @@ class Trainer:
         abs_diff = torch.abs(target - pred)
         l1_loss = abs_diff.mean(1, True)
 
-        if self.opt.no_ssim:
-            reprojection_loss = l1_loss
-        else:
-            ssim_loss = self.ssim(pred, target).mean(1, True)
-            reprojection_loss = 0.85 * ssim_loss + 0.15 * l1_loss
+        ssim_loss = self.ssim(pred, target).mean(1, True)
+        reprojection_loss = 0.85 * ssim_loss + 0.15 * l1_loss
 
         return reprojection_loss
 
@@ -365,62 +367,63 @@ class Trainer:
         losses = {}
         total_loss = 0
 
+        # scale 별 Loss를 구합니다. [0, 1, 2, 3]
         for scale in self.opt.scales:
             loss = 0
             reprojection_losses = []
+            source_scale = 0
 
-            if self.opt.v1_multiscale:
-                source_scale = scale
-            else:
-                source_scale = 0
-
+            # outputs[('disp', scales)].shape : (B, C=1, H//(2**scales), W//(2**scales))
             disp = outputs[("disp", scale)]
+            # (2**scale) 만큼 다운사이즈된 I_{t}
             color = inputs[("color", 0, scale)]
+            # scale 변화가 없는 I_{t}
             target = inputs[("color", 0, source_scale)]
 
             for frame_id in self.opt.frame_ids[1:]:
+                # outputs[("color", frame_id, scale)]는 source_scale의 크기를 가짐
+                # outputs[("color", frame_id, scale)]에서 frame_id는 -1 또는 1을 가지며 scale은 0, 1, 2, 3을 가짐
+                # outputs[("color", frame_id, scale)]의 크기는 source_scale을 가지나 scale 만큼 downsampling된 이미지로 부터 생성된 것을 의미함
                 pred = outputs[("color", frame_id, scale)]
+                
+                # pred.shape : (B, 1, source_height, source_width)
+                # target.shape : (B, 1, source_height, source_width)
                 reprojection_losses.append(self.compute_reprojection_loss(pred, target))
+            # I_{t}와 I_{t-1}, I_{t+1} 과 구한 reprojection loss
+            reprojection_loss = torch.cat(reprojection_losses, 1)
 
-            reprojection_losses = torch.cat(reprojection_losses, 1)
+            ############# auto-masking을 위한 identity_reprojection_loss를 구함 #########
+            identity_reprojection_losses = []
+            for frame_id in self.opt.frame_ids[1:]:
+                # pred는 scale 변화가 없는 I_{t'}
+                pred = inputs[("color", frame_id, source_scale)]
+                # target은 scale 변화가 없는 I_{t}
+                
+                # I_{t'} (pred) 와 I_{t} (target) 간의 reprojection loss를 구하며 이를 identity_reprojection_loss 라고 함
+                # auto masking을 적용하기 위하여 사용함
+                identity_reprojection_losses.append(self.compute_reprojection_loss(pred, target))
+            # I_{t}와 I_{t-1}, I_{t+1} 과 구한 identity reprojection loss
+            identity_reprojection_loss = torch.cat(identity_reprojection_losses, 1)
 
-            if not self.opt.disable_automasking:
-                identity_reprojection_losses = []
-                for frame_id in self.opt.frame_ids[1:]:
-                    pred = inputs[("color", frame_id, source_scale)]
-                    identity_reprojection_losses.append(
-                        self.compute_reprojection_loss(pred, target))
+            # add random numbers to break ties
+            identity_reprojection_loss += torch.randn(
+                identity_reprojection_loss.shape, device=self.device) * 0.00001
+            ###########################################################################
 
-                identity_reprojection_losses = torch.cat(identity_reprojection_losses, 1)
+            combined = torch.cat((identity_reprojection_loss, reprojection_loss), dim=1)
+            
+            # identity_reprojection_loss와 reprojection_loss 중 가장 작은 값을 선택합니다.
+            # 만약 identity_reprojection_loss 중에서 가장 작은 부분이 선택된다면 두 Frame 간 static 한 픽셀에 의해 loss가 가장 작아서 선택 된 것으로 가정하며
+            # static한 픽셀은 차이가 거의 없어 Loss가 0에 가까워지므로 auto-masking이 됩니다.
+            # reprojection_loss 중에서 가장 작은 값이 선택된다면 두 Frame 간 차이가 있는 것으로 가정하며, occluded pixel 문제 또한 처리된 것으로 판단합니다.
+            to_optimise, idxs = torch.min(combined, dim=1)
 
-                if self.opt.avg_reprojection:
-                    identity_reprojection_loss = identity_reprojection_losses.mean(1, keepdim=True)
-                else:
-                    # save both images, and do min all at once below
-                    identity_reprojection_loss = identity_reprojection_losses
-
-            reprojection_loss = reprojection_losses
-
-            if not self.opt.disable_automasking:
-                # add random numbers to break ties
-                identity_reprojection_loss += torch.randn(
-                    identity_reprojection_loss.shape, device=self.device) * 0.00001
-
-                combined = torch.cat((identity_reprojection_loss, reprojection_loss), dim=1)
-            else:
-                combined = reprojection_loss
-
-            if combined.shape[1] == 1:
-                to_optimise = combined
-            else:
-                to_optimise, idxs = torch.min(combined, dim=1)
-
-            if not self.opt.disable_automasking:
-                outputs["identity_selection/{}".format(scale)] = (
-                    idxs > identity_reprojection_loss.shape[1] - 1).float()
+            outputs["identity_selection/{}".format(scale)] = (
+                idxs > identity_reprojection_loss.shape[1] - 1).float()
 
             loss += to_optimise.mean()
 
+            # norm_disp : d^{*}_t 에 해당하며 norm_disp와 color 이미지를 통하여 smoothness loss를 구합니다. 
             mean_disp = disp.mean(2, True).mean(3, True)
             norm_disp = disp / (mean_disp + 1e-7)
             smooth_loss = get_smooth_loss(norm_disp, color)
@@ -497,14 +500,7 @@ class Trainer:
                     "disp_{}/{}".format(s, j),
                     normalize_image(outputs[("disp", s)][j]), self.step)
 
-                if self.opt.predictive_mask:
-                    for f_idx, frame_id in enumerate(self.opt.frame_ids[1:]):
-                        writer.add_image(
-                            "predictive_mask_{}_{}/{}".format(frame_id, s, j),
-                            outputs["predictive_mask"][("disp", s)][j, f_idx][None, ...],
-                            self.step)
-
-                elif not self.opt.disable_automasking:
+                if not self.opt.disable_automasking:
                     writer.add_image(
                         "automask_{}/{}".format(s, j),
                         outputs["identity_selection/{}".format(s)][j][None, ...], self.step)

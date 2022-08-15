@@ -80,8 +80,11 @@ class MonoDataset(data.Dataset):
             self.hue = 0.1
 
         self.resize = {}
+        # range(self.num_scales) : [0, 1, 2, 3]
         for i in range(self.num_scales):
+            # s : [1, 2, 4, 8]
             s = 2 ** i
+            # resize[i] : (height//(2**i), width//(2**i))
             self.resize[i] = transforms.Resize((self.height // s, self.width // s),
                                                interpolation=self.interp)
 
@@ -94,10 +97,23 @@ class MonoDataset(data.Dataset):
         images in this item. This ensures that all images input to the pose network receive the
         same augmentation.
         """
+        
+        # inputs의 key값을 list화 하여 iteration 합니다.
+        # inputs의 key값의 대상은 다음과 같습니다.
+        
+        # ("color", <frame_id>, <scale>)          for raw colour images,
+        # ("color_aug", <frame_id>, <scale>)      for augmented colour images,
+        # ("K", scale) or ("inv_K", scale)        for camera intrinsics,
+        # "stereo_T"                              for camera extrinsics, and
+        # "depth_gt"                              for ground truth depth maps.
+        
         for k in list(inputs):
+            # key값 k에 color가 있는 경우만 대상으로 합니다.
             frame = inputs[k]
             if "color" in k:
+                # n : "color", im : frame_id (0, -1, 1), scale = (0, 1, 2, 3)
                 n, im, i = k
+                # num_scales : 4 (len([0, 1, 2, 3]))
                 for i in range(self.num_scales):
                     inputs[(n, im, i)] = self.resize[i](inputs[(n, im, i - 1)])
 
@@ -154,11 +170,7 @@ class MonoDataset(data.Dataset):
             side = None
 
         for i in self.frame_idxs:
-            if i == "s":
-                other_side = {"r": "l", "l": "r"}[side]
-                inputs[("color", i, -1)] = self.get_color(folder, frame_index, other_side, do_flip)
-            else:
-                inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, side, do_flip)
+            inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, side, do_flip)
 
         # adjusting intrinsics to match each scale in the pyramid
         for scale in range(self.num_scales):
